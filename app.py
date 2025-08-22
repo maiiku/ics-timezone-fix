@@ -4,6 +4,7 @@ import requests
 import os
 import logging
 import html
+import time
 
 # Set up error logging
 logging.basicConfig(
@@ -90,6 +91,15 @@ ERROR_HTML_TEMPLATE = """
 </html>
 """
 
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'text/calendar, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Referer': 'https://outlook.office365.com/'
+}
+
 def validate_url(url):
     from urllib.parse import urlparse
     parsed = urlparse(url)
@@ -98,31 +108,49 @@ def validate_url(url):
     if parsed.scheme.lower() != 'https':
         raise ValueError('Only HTTPS URLs are allowed.')
 
-
-def validate_file_content(url):
+def validate_file_content(url, session: requests.Session = None):
     try:
-        r = requests.get(url, stream=True, timeout=15, headers={'Range': 'bytes=0-1023'})
+        sess = session or requests.Session()
+        r = sess.get(url, timeout=15, headers=DEFAULT_HEADERS, allow_redirects=True)
+        if 500 <= r.status_code < 600:
+            logging.warning(f'Upstream 5xx during validation for {url}. Final URL: {r.url} Status: {r.status_code}')
+            return sess
         r.raise_for_status()
-        partial_content = next(r.iter_content(1024))
-        if b'BEGIN:VCALENDAR' not in partial_content:
+        content = r.content[:4096]
+        if b'BEGIN:VCALENDAR' not in content:
             raise ValueError('The file does not appear to be a valid ICS file (BEGIN:VCALENDAR not found).')
+        return sess
+    except requests.RequestException as e:
+        logging.warning(f'Non-fatal validation fetch issue for {url}: {e}')
+        return session or requests.Session()
     except Exception as e:
         raise ValueError(f'Failed to read file content: {e}')
 
 
-def fetch_ics_content(url, max_file_size):
+def fetch_ics_content(url, max_file_size, session: requests.Session = None):
     try:
-        r = requests.get(url, stream=True, timeout=30)
-        r.raise_for_status()
-        ics_content = b''
-        for chunk in r.iter_content(4096):
-            ics_content += chunk
-            if len(ics_content) > max_file_size:
-                raise ValueError('The ICS file exceeds the maximum allowed size of 800 kB.')
-        return ics_content.decode('utf-8', errors='replace')
+        sess = session or requests.Session()
+        attempts = 0
+        last_exc = None
+        while attempts < 3:
+            attempts += 1
+            try:
+                r = sess.get(url, timeout=30, headers=DEFAULT_HEADERS, allow_redirects=True)
+                if 500 <= r.status_code < 600:
+                    logging.warning(f'Upstream 5xx during fetch for {url}. Final URL: {r.url} Status: {r.status_code}')
+                    raise requests.HTTPError(f"server error {r.status_code}")
+                r.raise_for_status()
+                content = r.content
+                if len(content) > max_file_size:
+                    raise ValueError('The ICS file exceeds the maximum allowed size of 800 kB.')
+                return content.decode('utf-8', errors='replace')
+            except (requests.RequestException, requests.HTTPError) as e:
+                last_exc = e
+                time.sleep(min(2 ** attempts, 4))
+                continue
+        raise ValueError(f'Unable to fetch the ICS file after retries: {last_exc}')
     except Exception as e:
         raise ValueError(f'Unable to fetch the ICS file: {e}')
-
 
 def read_missing_timezones(filename):
     if not os.path.exists(filename):
@@ -130,13 +158,11 @@ def read_missing_timezones(filename):
     with open(filename, 'r', encoding='utf-8') as f:
         return f.read()
 
-
 def insert_missing_timezones(ics_content, missing_timezones):
     pos = ics_content.find('BEGIN:VEVENT')
     if pos == -1:
         raise ValueError('Invalid ICS file format.')
     return ics_content[:pos] + missing_timezones + '\n' + ics_content[pos:]
-
 
 class IcsTimezoneFixerResource:
     def on_get(self, req: Request, resp: Response):
@@ -149,8 +175,9 @@ class IcsTimezoneFixerResource:
             return
         try:
             validate_url(ics_url)
-            validate_file_content(ics_url)
-            ics_content = fetch_ics_content(ics_url, MAX_FILE_SIZE)
+            session = requests.Session()
+            session = validate_file_content(ics_url, session)
+            ics_content = fetch_ics_content(ics_url, MAX_FILE_SIZE, session)
             missing_timezones = read_missing_timezones(MISSING_TIMEZONES_FILE)
             modified_ics_content = insert_missing_timezones(ics_content, missing_timezones)
             resp.status = falcon.HTTP_200
@@ -160,7 +187,6 @@ class IcsTimezoneFixerResource:
             resp.set_header('Access-Control-Allow-Origin', '*')
         except Exception as e:
             logging.error(f'Error processing request for URL {ics_url}: {e}', exc_info=True)
-            # Check Accept header for HTML preference
             accept = req.accept or ''
             if 'text/html' in accept or '*/*' in accept:
                 error_html = ERROR_HTML_TEMPLATE.replace('{{error_message}}', html.escape(str(e)))
@@ -171,14 +197,6 @@ class IcsTimezoneFixerResource:
                 resp.status = falcon.HTTP_400
                 resp.text = f'Error: {e}'
             resp.set_header('Access-Control-Allow-Origin', '*')
-
-    def on_options(self, req: Request, resp: Response):
-        resp.status = falcon.HTTP_200
-        resp.set_header('Access-Control-Allow-Origin', '*')
-        resp.set_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        resp.set_header('Access-Control-Allow-Headers', 'Content-Type')
-        resp.set_header('Access-Control-Max-Age', '86400')
-
 
 app = falcon.App()
 app.add_route('/', IcsTimezoneFixerResource())

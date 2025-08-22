@@ -82,4 +82,18 @@ class TestIcsTimezoneFixer:
         assert response.headers['access-control-allow-origin'] == '*'
         assert 'GET' in response.headers['access-control-allow-methods']
         assert 'OPTIONS' in response.headers['access-control-allow-methods']
-        assert 'Content-Type' in response.headers['access-control-allow-headers'] 
+        assert 'Content-Type' in response.headers['access-control-allow-headers']
+
+    @pytest.mark.integration
+    def test_real_outlook_calendar_integration(self):
+        if os.environ.get('RUN_INTEGRATION_TESTS') != '1':
+            pytest.skip('Set RUN_INTEGRATION_TESTS=1 to run real network integration test')
+        url = 'https://outlook.office365.com/owa/calendar/36f17034f4af4056b1b19a0d355c525c@holmsecurity.com/f95e73173b294b06ac942d63aec6ce6010163340627182384649/S-1-8-3025012254-364708259-2680903488-3691858234/reachcalendar.ics'
+        response = self.client.simulate_get('/', params={'ics_url': url})
+        # Expect 200 on success; if 400, surface server-side message to aid diagnosis
+        assert response.headers['access-control-allow-origin'] == '*'
+        if response.status_code == 200:
+            assert response.headers['content-type'].startswith('text/calendar')
+            assert 'BEGIN:VCALENDAR' in response.text
+        else:
+            pytest.fail(f'Integration request failed with {response.status_code}: {response.text[:300]}') 
